@@ -9,7 +9,7 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "*", // En producción, pon aquí la URL de tu frontend en Render
+    origin: "*", // En producción, se recomienda restringir esto a tu dominio
     methods: ["GET", "POST"]
   }
 });
@@ -18,7 +18,6 @@ const io = new Server(server, {
 const rooms = new Map();
 
 // --- ORDEN MAESTRO DE LA NOCHE ---
-// Este orden se filtra dinámicamente según si es Noche 0 o Noche N
 const NIGHT_QUEUE_ORDER = [
   'ladron',        // SOLO Noche 0
   'cupido',        // SOLO Noche 0
@@ -198,7 +197,7 @@ io.on('connection', (socket) => {
     io.to(room.hostId).emit('full_state_update', { players: room.players });
   });
 
-  // 8. INICIO DE NOCHE (Lógica Crítica de Turnos)
+  // 8. INICIO DE NOCHE
   socket.on('start_night', ({ roomId, dayCount }) => {
     const room = rooms.get(roomId);
     if (!room) return;
@@ -232,9 +231,7 @@ io.on('connection', (socket) => {
                 return room.players.some(p => (p.role === 'lobos' || p.status.isWolf) && p.alive);
             }
 
-            // Resto de roles (Vidente, Bruja, etc.)
-            // IMPORTANTE: Aquí usamos p.alive. Como las muertes de ESTA noche aún no se han aplicado,
-            // si alguien muere a mitad de la noche, aquí sigue constando como vivo.
+            // Resto de roles
             return room.players.some(p => p.role === roleKey && p.alive);
         }
     });
@@ -269,7 +266,7 @@ io.on('connection', (socket) => {
             const baseStatus = initializePlayerStatus(newRole, room.rolesConfig);
             room.players[pIndex].status = { ...room.players[pIndex].status, ...baseStatus };
             
-            // Si el ladrón elige ser Cupido o Niño Salvaje en Noche 0, los metemos en la cola
+            // Si el ladrón elige ser Cupido o Niño Salvaje en Noche 0
             if (room.dayCount === 0) {
                 if (['cupido', 'nino_salvaje'].includes(newRole)) {
                     if (!room.nightQueue.includes(newRole)) {
@@ -307,18 +304,14 @@ io.on('connection', (socket) => {
     io.to(room.hostId).emit('votes_update', room.votes);
   });
 
-  // 11. PUBLICAR RESULTADOS (Amanecer / Linchamiento)
+  // 11. PUBLICAR RESULTADOS
   socket.on('publish_results', ({ roomId, updatedPlayers, phase, eventData }) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
-    // Aquí se actualiza quién está realmente muerto
     room.players = updatedPlayers;
     room.phase = phase;
 
-    // BROADCAST: Esto envía a TODOS los dispositivos la lista actualizada y la fase.
-    // Si la fase es 'day_announcement' (Amanecer), el frontend mostrará las víctimas
-    // porque 'updatedPlayers' ya tiene a las víctimas con alive: false.
     io.to(roomId).emit('game_update', {
         players: room.players,
         phase: phase,
@@ -338,21 +331,15 @@ io.on('connection', (socket) => {
   });
 });
 
-
-// --- FUNCIONES AUXILIARES ---
+// --- FUNCIONES AUXILIARES (DEFINIDAS FUERA DE IO.ON) ---
 
 function nextTurn(room, io) {
     room.queueIndex++;
     
     // FIN DE LA NOCHE
     if (room.queueIndex >= room.nightQueue.length) {
-        // Marcamos fase de procesado
         room.phase = 'day_processing';
-        
-        // Enviamos acciones al Narrador para calcular muertes
         io.to(room.hostId).emit('night_ended', { actions: room.actions });
-        
-        // A los jugadores: pantalla de espera "Amaneciendo..."
         io.to(room.id).emit('phase_change', 'day_wait');
         return;
     }
@@ -360,19 +347,14 @@ function nextTurn(room, io) {
     const currentRole = room.nightQueue[room.queueIndex];
     room.currentTurnRole = currentRole;
 
-    // Notificar Narrador
     io.to(room.hostId).emit('narrator_turn_update', { role: currentRole });
 
-    // Notificar Jugadores
     room.players.forEach(p => {
         if (!p.socketId) return;
 
         let status = 'sleeping';
         
         // --- LÓGICA "DEAD MAN WALKING" ---
-        // Verificamos p.alive. Como las muertes de esta noche se calculan AL FINAL,
-        // p.alive sigue siendo true aquí, incluso si la bruja lo "mató" hace 5 minutos
-        // en acciones acumuladas. Por tanto, el jugador despertará y actuará.
         if (p.alive) {
             if (currentRole === 'lobos') {
                 if (p.role === 'lobos' || p.status.isWolf) {
@@ -464,22 +446,3 @@ const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`Servidor Lobo Online corriendo en puerto ${PORT}`);
 });
-```
-
-### Explicación de las correcciones:
-
-1.  **"Un muerto puede actuar":**
-    * Fíjate en la función `nextTurn`. Solo chequeamos `if (p.alive)`.
-    * Como las muertes no se aplican a `room.players` hasta que el Narrador llama a `publish_results` (al amanecer), si la Bruja mata a la Vidente en el turno 12 de la noche, y la Vidente actúa en el turno 4, **la Vidente sigue teniendo `alive: true` en la base de datos del servidor**. Por tanto, recibirá el evento `active` y su móvil le dejará jugar.
-
-2.  **Filtrado de Noche 0 Estricto:**
-    * En `start_night`, he añadido una lógica explícita:
-        ```javascript
-        if (room.dayCount === 0) {
-            // SOLO Ladrón, Cupido, Niño Salvaje
-            return isNightZeroRole && ...
-        } else {
-            // TODOS MENOS Ladrón, Cupido, Niño Salvaje
-            if (isNightZeroRole) return false;
-            // ... resto de lógica
-        }
