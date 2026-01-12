@@ -1,457 +1,485 @@
-// =================================================================================
-// 🐺 SERVIDOR MAESTRO: HOMBRES LOBO DE CASTRONEGRO ONLINE 🐺
-// =================================================================================
-
 const express = require('express');
 const http = require('http');
-const { Server } = require("socket.io");
+const { Server } = require('socket.io');
 const cors = require('cors');
 
 const app = express();
 app.use(cors());
-const server = http.createServer(app);
 
+const server = http.createServer(app);
 const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] }
+  cors: {
+    origin: "*", // En producción, pon aquí la URL de tu frontend en Render
+    methods: ["GET", "POST"]
+  }
 });
 
-// --- ESTADO GLOBAL ---
-const rooms = {};
+// --- BASE DE DATOS EN MEMORIA ---
+const rooms = new Map();
+
+// --- ORDEN MAESTRO DE LA NOCHE ---
+// Este orden se filtra dinámicamente según si es Noche 0 o Noche N
+const NIGHT_QUEUE_ORDER = [
+  'ladron',        // SOLO Noche 0
+  'cupido',        // SOLO Noche 0
+  'nino_salvaje',  // SOLO Noche 0
+  'vidente',       
+  'protector',     
+  'puta',          
+  'lobos',         
+  'lobo_albino',   
+  'padre_lobo',    
+  'zorro',         
+  'sectario',      
+  'flautista',     
+  'bruja',         
+  'cuervo',        
+  'juez'           
+];
 
 // --- UTILIDADES ---
-const shuffle = (array) => {
-    let currentIndex = array.length, randomIndex;
-    while (currentIndex !== 0) {
-        randomIndex = Math.floor(Math.random() * currentIndex);
-        currentIndex--;
-        [array[currentIndex], array[randomIndex]] = [array[randomIndex], array[currentIndex]];
-    }
-    return array;
+const generateRoomCode = () => Math.random().toString(36).substring(2, 6).toUpperCase();
+
+const shuffleArray = (array) => {
+  for (let i = array.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [array[i], array[j]] = [array[j], array[i]];
+  }
+  return array;
 };
 
-// --- LÓGICA DEL DOMADOR DE OSOS ---
-const checkBearGrowl = (roomCode) => {
-    const room = rooms[roomCode];
-    if (!room) return;
-    
-    const alivePlayers = room.players.filter(p => p.alive);
-    const tamer = alivePlayers.find(p => p.role === 'domador');
-    
-    // El domador solo funciona si está vivo y no está infectado
-    if (tamer && !tamer.attributes.infected) { 
-        const tamerIndex = alivePlayers.indexOf(tamer);
-        const total = alivePlayers.length;
-        
-        // Vecinos circulares (solo vivos)
-        const left = alivePlayers[(tamerIndex - 1 + total) % total];
-        const right = alivePlayers[(tamerIndex + 1) % total];
-        
-        const isWolf = (p) => p.role === 'lobo' || p.role === 'lobo_albino' || p.role === 'padre_lobo' || p.attributes.infected || p.attributes.isWolf;
-
-        if (isWolf(left) || isWolf(right)) {
-            io.to(roomCode).emit('bear_growl'); // Sonido general
-            io.to(tamer.socketId).emit('bear_growl_personal'); // Modal al domador
-            io.to(room.hostId).emit('narrator_info', { message: "🐻 El Oso ha gruñido (Lobo adyacente)." });
-        }
-    }
-};
-
-// --- FUNCIÓN CRÍTICA: MATAR JUGADOR ---
-const killPlayer = (roomCode, playerId, cause = "generic") => {
-    const room = rooms[roomCode];
-    if (!room) return;
-    const victim = room.players.find(p => p.id === playerId);
-    
-    if (!victim || !victim.alive) return;
-
-    // 1. Ejecutar muerte
-    victim.alive = false;
-    console.log(`💀 MUERTE en ${roomCode}: ${victim.name} (${cause})`);
-    io.to(roomCode).emit('player_killed', { playerId: victim.id, cause });
-
-    // 2. REGLA CUPIDO (Corazón Roto)
-    if (victim.linkedTo) {
-        const partner = room.players.find(p => p.id === victim.linkedTo);
-        if (partner && partner.alive) {
-            partner.alive = false;
-            io.to(roomCode).emit('force_heartbreak', { 
-                victimName: victim.name, 
-                partnerName: partner.name 
-            });
-            // Si el partner era cazador, activar venganza
-            if (partner.role === 'cazador') {
-                setTimeout(() => io.to(partner.socketId).emit('hunter_revenge_trigger'), 2500);
-            }
-        }
-    }
-
-    // 3. REGLA NIÑO SALVAJE
-    room.players.forEach(p => {
-        if (p.role === 'nino_salvaje' && p.attributes.mentor === victim.id) {
-            p.attributes.isWolf = true; 
-            io.to(p.socketId).emit('wild_child_transform');
-            io.to(room.hostId).emit('narrator_info', { message: `🐺 El Niño Salvaje (${p.name}) se ha transformado en Lobo.` });
-        }
-    });
-
-    // 4. REGLA CABALLERO ESPADA OXIDADA
-    if (victim.role === 'caballero' && cause === 'lobos' && !victim.attributes.infected) {
-        io.to(room.hostId).emit('narrator_info', { message: "⚔️ El Caballero ha muerto devorado. El lobo a su izquierda debe morir mañana por Tétanos." });
-    }
-
-    // 5. REGLA CAZADOR
-    if (victim.role === 'cazador') {
-        io.to(victim.socketId).emit('hunter_revenge_trigger');
-    }
-
-    // 6. REGLA ANCIANO (Pérdida de poderes)
-    // Según tu petición: Solo si el cazador le dispara o linchamiento (opcional, aquí pongo cazador estricto según petición)
-    if (victim.role === 'anciano' && cause === 'Disparo del Cazador') {
-         io.to(room.hostId).emit('narrator_info', { message: "⚠️ El Cazador mató al Anciano. ¡El pueblo pierde sus poderes!" });
-         io.to(roomCode).emit('ancient_death_penalty'); // Frontend desactiva habilidades
-    }
-
-    checkVictoryCondition(roomCode);
-};
-
-// NUEVA FUNCIÓN: Revivir a un jugador (Bruja)
-const revivePlayer = (roomCode, playerId) => {
-    const room = rooms[roomCode];
-    if (!room) return;
-    const player = room.players.find(p => p.id === playerId);
-    if (!player) return;
-
-    if (!player.alive) {
-        player.alive = true;
-        io.to(roomCode).emit('player_revived', { playerId: player.id });
-    }
-};
-
-const checkVictoryCondition = (roomCode) => {
-    const room = rooms[roomCode];
-    if (!room) return;
-    const alive = room.players.filter(p => p.alive);
-    
-    const wolves = alive.filter(p => 
-        p.role === 'lobo' || p.role === 'lobo_albino' || p.role === 'padre_lobo' || 
-        p.attributes.infected || p.attributes.isWolf
-    );
-    const villagers = alive.filter(p => !wolves.includes(p));
-
-    // Victoria Enamorados
-    if (alive.length === 2 && alive[0].linkedTo === alive[1].id) {
-        const p1IsWolf = wolves.includes(alive[0]);
-        const p2IsWolf = wolves.includes(alive[1]);
-        if (p1IsWolf !== p2IsWolf) {
-             io.to(roomCode).emit('game_over', { winner: 'lovers', message: '¡El Amor Prohibido ha ganado!' });
-             return;
-        }
-    }
-
-    if (wolves.length === 0 && villagers.length > 0) {
-        io.to(roomCode).emit('game_over', { winner: 'villagers', message: '¡El Pueblo ha vencido!' });
-    } else if (wolves.length >= villagers.length) {
-        io.to(roomCode).emit('game_over', { winner: 'wolves', message: '¡Los Lobos han ganado!' });
-    } else if (alive.length === 0) {
-        io.to(roomCode).emit('game_over', { winner: 'nobody', message: 'Todos han muerto...' });
-    }
-};
-
-// --- SOCKETS ---
+// --- SOCKET.IO LÓGICA ---
 io.on('connection', (socket) => {
-    console.log('🟢 Conectado:', socket.id);
+  console.log(`Cliente conectado: ${socket.id}`);
 
-    // 1. SALA
-    socket.on('create_room', (data, callback) => {
-        const roomCode = Math.random().toString(36).substring(2, 6).toUpperCase();
-        const hostName = typeof data === 'object' ? (data.hostName || data.narratorName) : data;
-        
-        rooms[roomCode] = {
-            hostId: socket.id,
-            hostName: hostName,
-            players: [],
-            phase: 'lobby',
-            votes: {},
-            centerCards: [] // Para el ladrón
+  // 1. CREACIÓN DE SALA
+  socket.on('create_room', ({ hostName, system }, callback) => {
+    const roomId = generateRoomCode();
+    
+    rooms.set(roomId, {
+      id: roomId,
+      hostId: socket.id,
+      gameMode: system,
+      players: [],
+      phase: 'lobby',        
+      dayCount: 0,
+      rolesConfig: {},
+      nightQueue: [],
+      queueIndex: 0,
+      currentTurnRole: null,
+      wolfSpokesperson: null,
+      actions: {},
+      votes: {},
+      globalFlags: {
+          ancientPowerLoss: false,
+          hunterSource: null
+      }
+    });
+
+    socket.join(roomId);
+    callback({ code: roomId });
+    console.log(`Sala ${roomId} creada por ${hostName}`);
+  });
+
+  // 2. VALIDACIÓN DE SALA
+  socket.on('check_room', (roomId, callback) => {
+    callback({ exists: rooms.has(roomId) });
+  });
+
+  // 3. OBTENER IDENTIDADES DISPONIBLES
+  socket.on('get_available_identities', (roomId, callback) => {
+    const room = rooms.get(roomId);
+    if (!room) return callback([]);
+    callback(room.players.map(p => ({ 
+        name: p.name, 
+        socketId: p.socketId 
+    })));
+  });
+
+  // 4. ACTUALIZAR LISTA DE JUGADORES
+  socket.on('update_player_list', ({ roomId, players }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    const mergedPlayers = players.map(newP => {
+        const existing = room.players.find(p => p.id === newP.id);
+        return {
+            id: newP.id,
+            name: newP.name,
+            socketId: existing ? existing.socketId : null,
+            role: existing ? existing.role : 'aldeano',
+            alive: existing ? existing.alive : true,
+            status: existing ? existing.status : createDefaultStatus()
         };
-        socket.join(roomCode);
-        if (callback) callback({ roomCode });
     });
 
-    socket.on('check_room', ({ roomCode }, callback) => {
-        callback({ valid: !!rooms[roomCode] });
-    });
+    room.players = mergedPlayers;
+    io.to(roomId).emit('player_list_updated', room.players.map(p => ({ name: p.name, socketId: p.socketId })));
+  });
 
-    socket.on('update_player_list', ({ roomCode, players }) => {
-        if (!rooms[roomCode]) return;
-        const oldPlayers = rooms[roomCode].players;
-        rooms[roomCode].players = players.map(newP => {
-            const existing = oldPlayers.find(old => old.name === newP.name);
-            return {
-                id: newP.id || Date.now() + Math.random(),
-                name: newP.name,
-                socketId: existing ? existing.socketId : null,
-                role: existing ? existing.role : null,
-                alive: existing ? existing.alive : true,
-                seenRole: existing ? existing.seenRole : false,
-                linkedTo: existing ? existing.linkedTo : null,
-                attributes: existing ? existing.attributes : {}
-            };
-        });
-        io.to(roomCode).emit('player_list_updated', rooms[roomCode].players);
-    });
+  // 5. RECLAMAR IDENTIDAD
+  socket.on('claim_identity', ({ roomId, name }, callback) => {
+    const room = rooms.get(roomId);
+    if (!room) return callback(false);
 
-    socket.on('get_available_identities', ({ roomCode }, cb) => {
-        if (rooms[roomCode]) cb({ identities: rooms[roomCode].players });
-        else cb({ identities: [] });
-    });
+    const playerIndex = room.players.findIndex(p => p.name === name);
+    if (playerIndex === -1) return callback(false);
+    if (room.players[playerIndex].socketId && room.players[playerIndex].socketId !== socket.id) {
+        return callback(false);
+    }
 
-    socket.on('claim_identity', ({ roomCode, playerId }, cb) => {
-        const room = rooms[roomCode];
-        if (!room) return;
-        const player = room.players.find(p => p.id === playerId);
-        if (player) {
-            player.socketId = socket.id;
-            socket.join(roomCode);
-            io.to(roomCode).emit('player_list_updated', room.players);
-            
-            // Reconexión
-            if (room.phase !== 'lobby') {
-                socket.emit('reconnect_state', { role: player.role, alive: player.alive });
-            }
-            if (cb) cb({ success: true });
-        } else {
-            if (cb) cb({ success: false });
+    room.players[playerIndex].socketId = socket.id;
+    socket.join(roomId);
+    
+    io.to(roomId).emit('player_list_updated', room.players.map(p => ({ name: p.name, socketId: p.socketId })));
+    callback(true);
+  });
+
+  // 6. INICIAR JUEGO
+  socket.on('game_start', (roomId) => {
+      const room = rooms.get(roomId);
+      if (!room) return;
+      io.to(roomId).emit('game_start'); 
+  });
+
+  // 7. REPARTO DE ROLES
+  socket.on('distribute_roles', ({ roomId, rolesCount, manualAssignments }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    room.rolesConfig = rolesCount;
+
+    if (room.gameMode === 'custom' && manualAssignments) {
+        let sectTeamAssignments = new Array(room.players.length).fill(null);
+        if (rolesCount['sectario'] > 0) {
+             const rolesArray = room.players.map(p => manualAssignments[p.id]);
+             assignSectTeams(rolesArray, sectTeamAssignments);
         }
-    });
 
-    // 2. REPARTO
-    socket.on('distribute_roles_digital', ({ roomCode, rolesSettings }) => {
-        const room = rooms[roomCode];
-        if (!room) return;
-        
+        room.players = room.players.map((p, idx) => {
+            const roleKey = manualAssignments[p.id] || 'aldeano';
+            const status = initializePlayerStatus(roleKey, rolesCount);
+            if (sectTeamAssignments[idx]) status.sectTeam = sectTeamAssignments[idx];
+            return { ...p, role: roleKey, status };
+        });
+
+    } else {
         let deck = [];
-        Object.entries(rolesSettings).forEach(([role, count]) => {
+        Object.entries(rolesCount).forEach(([role, count]) => {
             for(let i=0; i<count; i++) deck.push(role);
         });
-        
-        // Rellenar con aldeanos si faltan, o dejar sobrantes para el ladrón
         while(deck.length < room.players.length) deck.push('aldeano');
         
-        deck = shuffle(deck);
+        deck = shuffleArray(deck);
 
-        // Asignar roles a jugadores
-        room.players.forEach((p, i) => {
-            p.role = deck[i] || 'aldeano';
-            p.alive = true;
-            p.seenRole = false;
-            p.attributes = {};
-            if (p.socketId) io.to(p.socketId).emit('start_role_animation', { role: p.role });
+        let sectTeamAssignments = new Array(deck.length).fill(null);
+        if (rolesCount['sectario'] > 0) {
+             assignSectTeams(deck, sectTeamAssignments);
+        }
+
+        room.players = room.players.map((p, idx) => {
+            const roleKey = deck[idx];
+            const status = initializePlayerStatus(roleKey, rolesCount);
+            if (sectTeamAssignments[idx]) status.sectTeam = sectTeamAssignments[idx];
+            return { ...p, role: roleKey, status };
         });
+    }
 
-        // Guardar cartas sobrantes para el Ladrón
-        if (deck.length > room.players.length) {
-            room.centerCards = deck.slice(room.players.length);
-        } else {
-            room.centerCards = ['aldeano', 'aldeano']; // Fallback
-        }
-
-        room.phase = 'setup';
-        socket.emit('narrator_waiting_ack'); 
-    });
-
-    socket.on('distribute_roles_manual', ({ roomCode }) => {
-        const room = rooms[roomCode];
-        if (!room) return;
-        io.to(roomCode).emit('manual_distribution_start');
-        room.phase = 'setup';
-    });
-    
-    socket.on('manual_roles_assigned', ({ roomCode, playersWithRoles }) => {
-        const room = rooms[roomCode];
-        playersWithRoles.forEach(pWR => {
-            const p = room.players.find(x => x.id === pWR.id);
-            if (p) {
-                p.role = pWR.role;
-                p.alive = true;
-                p.seenRole = true; 
-                if(p.socketId) io.to(p.socketId).emit('role_assigned_manual', { role: p.role });
-            }
-        });
-        socket.emit('distribution_completed', room.players);
-    });
-
-    socket.on('ack_role_seen', ({ roomCode, playerId }) => {
-        const room = rooms[roomCode];
-        if (!room) return;
-        const p = room.players.find(x => x.id === playerId);
-        if (p) p.seenRole = true;
-        io.to(room.hostId).emit('player_ack_update', { playerId });
-        if (room.players.every(pl => pl.seenRole)) {
-            io.to(room.hostId).emit('all_roles_seen');
-        }
-    });
-
-    socket.on('start_game_process', ({ roomCode }) => {
-        io.to(roomCode).emit('game_started');
-        checkBearGrowl(roomCode);
-    });
-
-    // 4. TURNOS DE NOCHE
-    socket.on('trigger_turn', ({ roomCode, roleToWake }) => {
-        const room = rooms[roomCode];
-        if (!room) return;
-
-        io.to(roomCode).emit('sleep'); // Todos duermen
-
-        if (roleToWake === 'lobos') {
-            const wolves = room.players.filter(p => 
-                (p.role === 'lobo' || p.role === 'lobo_albino' || p.role === 'padre_lobo' || p.attributes.infected || p.attributes.isWolf) 
-                && p.alive
-            );
-            
-            if (wolves.length > 0) {
-                // ELEGIR PORTAVOZ ALEATORIO CADA NOCHE
-                const spokesperson = wolves[Math.floor(Math.random() * wolves.length)];
-                
-                wolves.forEach(w => {
-                    if (w.id === spokesperson.id) {
-                        io.to(w.socketId).emit('wake_up_action', { role: 'lobo', isSpokesperson: true });
-                    } else {
-                        io.to(w.socketId).emit('wake_up_passive', { role: 'lobo', spokespersonName: spokesperson.name });
-                    }
-                });
-            } else {
-                io.to(room.hostId).emit('turn_info', { message: "No hay lobos vivos." });
-            }
-        } 
-        else if (roleToWake === 'ladron') {
-            // Ladrón recibe las cartas sobrantes
-            const thief = room.players.find(p => p.role === 'ladron' && p.alive);
-            if (thief) {
-                 io.to(thief.socketId).emit('wake_up_action', { role: 'ladron', centerCards: room.centerCards });
-            }
-        }
-        else {
-            const targets = room.players.filter(p => p.role === roleToWake);
-            targets.forEach(p => {
-                if (p.alive) {
-                    io.to(p.socketId).emit('wake_up_action', { role: roleToWake });
-                } else {
-                    io.to(p.socketId).emit('wake_up_dead', { role: roleToWake });
-                }
+    room.players.forEach(p => {
+        if (p.socketId) {
+            io.to(p.socketId).emit('role_assigned', { 
+                role: p.role, 
+                status: p.status,
+                playerData: p 
             });
         }
     });
 
-    // Acciones de roles
-    socket.on('action_performed', ({ roomCode, action, targetId, extraData }) => {
-        const room = rooms[roomCode];
-        if (!room) return;
+    io.to(room.hostId).emit('full_state_update', { players: room.players });
+  });
 
-        if (action === 'cupid_link') {
-            const { p1Id, p2Id } = extraData;
-            const p1 = room.players.find(p => p.id === p1Id);
-            const p2 = room.players.find(p => p.id === p2Id);
-            if (p1 && p2) {
-                p1.linkedTo = p2.id;
-                p2.linkedTo = p1.id;
-                io.to(p1.socketId).emit('you_are_in_love', { partnerName: p2.name });
-                io.to(p2.socketId).emit('you_are_in_love', { partnerName: p1.name });
+  // 8. INICIO DE NOCHE (Lógica Crítica de Turnos)
+  socket.on('start_night', ({ roomId, dayCount }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    room.phase = 'night';
+    room.dayCount = dayCount;
+    room.actions = {}; 
+    
+    // --- FILTRADO DE COLA (Regla de Noche 0 vs Resto) ---
+    const activeQueue = NIGHT_QUEUE_ORDER.filter(roleKey => {
+        const isNightZeroRole = ['ladron', 'cupido', 'nino_salvaje'].includes(roleKey);
+
+        // Caso 1: Noche Cero
+        if (room.dayCount === 0) {
+            // Solo entran los roles de setup inicial si existen y están vivos
+            return isNightZeroRole && room.players.some(p => p.role === roleKey && p.alive);
+        } 
+        
+        // Caso 2: Noches Normales (Día 1+)
+        else {
+            // EXCLUIR explícitamente roles de Noche 0
+            if (isNightZeroRole) return false;
+
+            // Lobo Albino: Solo noches pares (2, 4, 6...)
+            if (roleKey === 'lobo_albino') {
+                return room.players.some(p => p.role === 'lobo_albino' && p.alive) && (room.dayCount % 2 === 0);
+            }
+
+            // Lobos normales
+            if (roleKey === 'lobos') {
+                return room.players.some(p => (p.role === 'lobos' || p.status.isWolf) && p.alive);
+            }
+
+            // Resto de roles (Vidente, Bruja, etc.)
+            // IMPORTANTE: Aquí usamos p.alive. Como las muertes de ESTA noche aún no se han aplicado,
+            // si alguien muere a mitad de la noche, aquí sigue constando como vivo.
+            return room.players.some(p => p.role === roleKey && p.alive);
+        }
+    });
+
+    room.nightQueue = activeQueue;
+    room.queueIndex = -1;
+
+    // Elección de Portavoz Lobo
+    const wolves = room.players.filter(p => (p.role === 'lobos' || p.status.isWolf) && p.alive);
+    if (wolves.length > 0) {
+        const randomWolf = wolves[Math.floor(Math.random() * wolves.length)];
+        room.wolfSpokesperson = randomWolf.socketId;
+    }
+
+    nextTurn(room, io);
+  });
+
+  // 9. ACCIÓN NOCTURNA
+  socket.on('night_action', ({ roomId, actionData }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    room.actions = { ...room.actions, ...actionData };
+
+    // Ladrón: Transformación inmediata en Noche 0 para ajustar la cola
+    if (actionData.newRole && actionData.thiefId) {
+        const pIndex = room.players.findIndex(p => p.id === actionData.thiefId);
+        if (pIndex !== -1) {
+            const newRole = actionData.newRole;
+            room.players[pIndex].role = newRole;
+            
+            const baseStatus = initializePlayerStatus(newRole, room.rolesConfig);
+            room.players[pIndex].status = { ...room.players[pIndex].status, ...baseStatus };
+            
+            // Si el ladrón elige ser Cupido o Niño Salvaje en Noche 0, los metemos en la cola
+            if (room.dayCount === 0) {
+                if (['cupido', 'nino_salvaje'].includes(newRole)) {
+                    if (!room.nightQueue.includes(newRole)) {
+                        room.nightQueue.splice(room.queueIndex + 1, 0, newRole);
+                    }
+                }
+            }
+
+            if (room.players[pIndex].socketId) {
+                io.to(room.players[pIndex].socketId).emit('role_update', { 
+                    role: newRole, 
+                    status: room.players[pIndex].status 
+                });
+            }
+        }
+    }
+
+    nextTurn(room, io);
+  });
+
+  // 10. VOTACIÓN
+  socket.on('start_voting', ({ roomId, type }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    room.phase = type === 'mayor' ? 'voting_mayor' : 'voting_lynch';
+    room.votes = {}; 
+    io.to(roomId).emit('start_voting', { type });
+  });
+
+  socket.on('cast_vote', ({ roomId, targetId, voterId }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+    room.votes[voterId] = targetId;
+    io.to(room.hostId).emit('votes_update', room.votes);
+  });
+
+  // 11. PUBLICAR RESULTADOS (Amanecer / Linchamiento)
+  socket.on('publish_results', ({ roomId, updatedPlayers, phase, eventData }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    // Aquí se actualiza quién está realmente muerto
+    room.players = updatedPlayers;
+    room.phase = phase;
+
+    // BROADCAST: Esto envía a TODOS los dispositivos la lista actualizada y la fase.
+    // Si la fase es 'day_announcement' (Amanecer), el frontend mostrará las víctimas
+    // porque 'updatedPlayers' ya tiene a las víctimas con alive: false.
+    io.to(roomId).emit('game_update', {
+        players: room.players,
+        phase: phase,
+        eventData: eventData
+    });
+  });
+
+  socket.on('force_action_interaction', ({ roomId, actionData }) => {
+     const room = rooms.get(roomId);
+     if (room) {
+         io.to(room.hostId).emit('force_action_received', actionData);
+     }
+  });
+  
+  socket.on('disconnect', () => {
+      // Manejo de desconexión
+  });
+});
+
+
+// --- FUNCIONES AUXILIARES ---
+
+function nextTurn(room, io) {
+    room.queueIndex++;
+    
+    // FIN DE LA NOCHE
+    if (room.queueIndex >= room.nightQueue.length) {
+        // Marcamos fase de procesado
+        room.phase = 'day_processing';
+        
+        // Enviamos acciones al Narrador para calcular muertes
+        io.to(room.hostId).emit('night_ended', { actions: room.actions });
+        
+        // A los jugadores: pantalla de espera "Amaneciendo..."
+        io.to(room.id).emit('phase_change', 'day_wait');
+        return;
+    }
+
+    const currentRole = room.nightQueue[room.queueIndex];
+    room.currentTurnRole = currentRole;
+
+    // Notificar Narrador
+    io.to(room.hostId).emit('narrator_turn_update', { role: currentRole });
+
+    // Notificar Jugadores
+    room.players.forEach(p => {
+        if (!p.socketId) return;
+
+        let status = 'sleeping';
+        
+        // --- LÓGICA "DEAD MAN WALKING" ---
+        // Verificamos p.alive. Como las muertes de esta noche se calculan AL FINAL,
+        // p.alive sigue siendo true aquí, incluso si la bruja lo "mató" hace 5 minutos
+        // en acciones acumuladas. Por tanto, el jugador despertará y actuará.
+        if (p.alive) {
+            if (currentRole === 'lobos') {
+                if (p.role === 'lobos' || p.status.isWolf) {
+                    status = (p.socketId === room.wolfSpokesperson) ? 'active' : 'wolf_waiting';
+                }
+            } 
+            else if (currentRole === 'lobos' && p.role === 'nina') {
+                 status = 'spy'; 
+            }
+            else if (p.role === currentRole) {
+                status = 'active';
             }
         }
 
-        if (action === 'wild_child_mentor') {
-            const child = room.players.find(p => p.socketId === socket.id);
-            if (child) child.attributes.mentor = targetId;
-        }
-
-        if (action === 'thief_swap') {
-             // El ladrón cambia su rol en el servidor
-             const thief = room.players.find(p => p.socketId === socket.id);
-             if (thief && extraData.newRole) {
-                 thief.role = extraData.newRole;
-                 console.log(`Ladrón cambió a: ${thief.role}`);
-                 // Actualizamos su carta en el frontend
-                 socket.emit('role_assigned_manual', { role: thief.role });
-             }
-        }
-        
-        io.to(room.hostId).emit('narrator_action_report', { action, targetId, extraData });
-    });
-
-    // 5. VOTACIONES
-    socket.on('start_voting', ({ roomCode, type }) => {
-        const room = rooms[roomCode];
-        if (!room) return;
-        room.phase = 'voting';
-        room.votes = {};
-        io.to(roomCode).emit('show_voting_screen', { 
-            candidates: room.players.filter(p => p.alive),
-            type,
-            allowNull: type === 'lynch' // Linchamiento permite nulo
+        io.to(p.socketId).emit('turn_change', { 
+            status, 
+            role: currentRole,
+            data: {
+                isSpokesperson: p.socketId === room.wolfSpokesperson,
+                players: room.players 
+            }
         });
     });
+}
 
-    socket.on('cast_vote', ({ roomCode, targetId }) => {
-        const room = rooms[roomCode];
-        if (!room) return;
-        room.votes[socket.id] = targetId;
-        
-        const counts = {};
-        Object.values(room.votes).forEach(v => counts[v] = (counts[v] || 0) + 1);
-        io.to(roomCode).emit('voting_update', { counts });
-    });
+function createDefaultStatus() {
+    return {
+        protected: false,
+        infected: false,
+        charmed: false,
+        linked: null,
+        mentor: null,
+        isWolf: false,
+        lives: 1,
+        revealed: false,
+        extraVotes: 0,
+        potions: null,
+        fatherWolfUsed: null,
+        foxPowerLost: null,
+        judgePowerUsed: null,
+        cuervoUsed: null,
+        thiefChoices: null,
+        sectTeam: null,
+        tetanus: false
+    };
+}
 
-    socket.on('close_voting', ({ roomCode }) => {
-        const room = rooms[roomCode];
-        if (!room) return;
-        const counts = {};
-        Object.values(room.votes).forEach(v => counts[v] = (counts[v] || 0) + 1);
-        
-        let max = 0;
-        let winners = [];
-        Object.entries(counts).forEach(([id, c]) => {
-            if (c > max) { max = c; winners = [id]; }
-            else if (c === max) winners.push(id);
-        });
-
-        // REGLA CABEZA DE TURCO: Si hay empate en linchamiento y hay un cabeza de turco vivo, muere él
-        if (room.phase === 'voting' && winners.length > 1) { // Empate
-             const scapegoat = room.players.find(p => p.role === 'cabeza_turco' && p.alive);
-             if (scapegoat) {
-                 io.to(room.hostId).emit('narrator_info', { message: "⚖️ Empate. El Cabeza de Turco muere por ello." });
-                 // El narrador confirmará la muerte en el frontend, o podríamos hacerlo automático:
-                 // killPlayer(roomCode, scapegoat.id, "Cabeza de Turco (Empate)");
-                 // Dejamos que el frontend lo sugiera al Narrador.
-             }
-        }
-
-        io.to(room.hostId).emit('voting_result', { winners, counts, isTie: winners.length > 1 });
-        io.to(roomCode).emit('hide_voting_screen');
-    });
-
-    // 6. EVENTOS FINALES
-    socket.on('hunter_revenge_shot', ({ roomCode, targetId }) => {
-        killPlayer(roomCode, targetId, "Disparo del Cazador");
-        io.to(roomCode).emit('player_revived', { playerId: 'ALL' }); 
-    });
-
-    socket.on('confirm_death_manual', ({ roomCode, playerId, cause }) => {
-        killPlayer(roomCode, playerId, cause || "Narrador");
-    });
+function initializePlayerStatus(role, rolesCount) {
+    let status = createDefaultStatus();
     
-    socket.on('revive_player', ({ roomCode, playerId }) => {
-        revivePlayer(roomCode, playerId);
-    });
+    if (['lobo', 'lobos', 'lobo_albino', 'padre_lobo'].includes(role)) {
+        status.isWolf = true;
+    }
+    if (role === 'anciano') status.lives = 2;
+    if (role === 'bruja') status.potions = { life: true, death: true };
+    if (role === 'padre_lobo') status.fatherWolfUsed = false;
+    if (role === 'zorro') status.foxPowerLost = false;
+    if (role === 'juez') status.judgePowerUsed = false;
+    if (role === 'cuervo') status.cuervoUsed = false;
+    
+    if (role === 'ladron') {
+        status.thiefChoices = []; 
+    }
 
-    socket.on('game_reset', ({ roomCode, fullExit }) => {
-        if (fullExit) delete rooms[roomCode];
-        io.to(roomCode).emit('reset_game', { fullExit });
-    });
+    return status;
+}
 
-    socket.on('disconnect', () => { /* Log */ });
+function assignSectTeams(rolesArray, assignmentsArray) {
+    const sectarioIdx = rolesArray.indexOf('sectario');
+    if (sectarioIdx === -1) return;
+
+    const total = rolesArray.length;
+    const sectSize = Math.floor(total / 2);
+    
+    let indices = Array.from({length: total}, (_, i) => i).filter(i => i !== sectarioIdx);
+    indices = shuffleArray(indices);
+    
+    assignmentsArray[sectarioIdx] = 'secta';
+    
+    for (let i=0; i < sectSize - 1; i++) {
+        assignmentsArray[indices[i]] = 'secta';
+    }
+    for (let i=sectSize - 1; i < indices.length; i++) {
+        assignmentsArray[indices[i]] = 'rival';
+    }
+}
+
+const PORT = process.env.PORT || 3001;
+server.listen(PORT, () => {
+  console.log(`Servidor Lobo Online corriendo en puerto ${PORT}`);
 });
+```
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`SERVIDOR LOBO ACTIVO: ${PORT}`));
+### Explicación de las correcciones:
+
+1.  **"Un muerto puede actuar":**
+    * Fíjate en la función `nextTurn`. Solo chequeamos `if (p.alive)`.
+    * Como las muertes no se aplican a `room.players` hasta que el Narrador llama a `publish_results` (al amanecer), si la Bruja mata a la Vidente en el turno 12 de la noche, y la Vidente actúa en el turno 4, **la Vidente sigue teniendo `alive: true` en la base de datos del servidor**. Por tanto, recibirá el evento `active` y su móvil le dejará jugar.
+
+2.  **Filtrado de Noche 0 Estricto:**
+    * En `start_night`, he añadido una lógica explícita:
+        ```javascript
+        if (room.dayCount === 0) {
+            // SOLO Ladrón, Cupido, Niño Salvaje
+            return isNightZeroRole && ...
+        } else {
+            // TODOS MENOS Ladrón, Cupido, Niño Salvaje
+            if (isNightZeroRole) return false;
+            // ... resto de lógica
+        }
