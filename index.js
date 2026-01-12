@@ -9,7 +9,7 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "*", // En producción, se recomienda restringir esto a tu dominio
+    origin: "*", // En producción, se recomienda poner el dominio de tu frontend
     methods: ["GET", "POST"]
   }
 });
@@ -47,7 +47,7 @@ const shuffleArray = (array) => {
   return array;
 };
 
-// --- SOCKET.IO LÓGICA ---
+// --- SOCKET.IO LÓGICA PRINCIPAL ---
 io.on('connection', (socket) => {
   console.log(`Cliente conectado: ${socket.id}`);
 
@@ -58,7 +58,7 @@ io.on('connection', (socket) => {
     rooms.set(roomId, {
       id: roomId,
       hostId: socket.id,
-      gameMode: system,
+      gameMode: system, // 'standard' o 'custom'
       players: [],
       phase: 'lobby',        
       dayCount: 0,
@@ -100,6 +100,7 @@ io.on('connection', (socket) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
+    // Fusionar para mantener sockets si ya estaban conectados
     const mergedPlayers = players.map(newP => {
         const existing = room.players.find(p => p.id === newP.id);
         return {
@@ -123,6 +124,8 @@ io.on('connection', (socket) => {
 
     const playerIndex = room.players.findIndex(p => p.name === name);
     if (playerIndex === -1) return callback(false);
+    
+    // Evitar robo de identidad si ya tiene dueño
     if (room.players[playerIndex].socketId && room.players[playerIndex].socketId !== socket.id) {
         return callback(false);
     }
@@ -134,21 +137,27 @@ io.on('connection', (socket) => {
     callback(true);
   });
 
-  // 6. INICIAR JUEGO
-  socket.on('game_start', (roomId) => {
+  // 6. INICIAR MODO ASIGNACIÓN MANUAL (Nuevo Evento)
+  // Esto avisa a los jugadores que el narrador está repartiendo cartas físicas
+  socket.on('start_manual_assign', ({ roomId }) => {
       const room = rooms.get(roomId);
       if (!room) return;
-      io.to(roomId).emit('game_start'); 
+      
+      room.phase = 'assigning';
+      // Emitimos cambio de fase para que los móviles muestren mensaje de espera
+      io.to(roomId).emit('phase_change', 'assigning');
   });
 
-  // 7. REPARTO DE ROLES
+  // 7. REPARTO DE ROLES (Soporta Digital y Manual)
   socket.on('distribute_roles', ({ roomId, rolesCount, manualAssignments }) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
     room.rolesConfig = rolesCount;
 
-    if (room.gameMode === 'custom' && manualAssignments) {
+    if (manualAssignments) {
+        // --- MODO PERSONALIZADO (Manual) ---
+        // Aplicar lógica de Sectario si existe
         let sectTeamAssignments = new Array(room.players.length).fill(null);
         if (rolesCount['sectario'] > 0) {
              const rolesArray = room.players.map(p => manualAssignments[p.id]);
@@ -163,6 +172,7 @@ io.on('connection', (socket) => {
         });
 
     } else {
+        // --- MODO DIGITAL (Aleatorio) ---
         let deck = [];
         Object.entries(rolesCount).forEach(([role, count]) => {
             for(let i=0; i<count; i++) deck.push(role);
@@ -184,6 +194,7 @@ io.on('connection', (socket) => {
         });
     }
 
+    // EMITIR A CADA JUGADOR SU ROL
     room.players.forEach(p => {
         if (p.socketId) {
             io.to(p.socketId).emit('role_assigned', { 
@@ -194,59 +205,24 @@ io.on('connection', (socket) => {
         }
     });
 
+    // Enviar estado completo al Narrador
     io.to(room.hostId).emit('full_state_update', { players: room.players });
   });
 
-  // 8. INICIO DE NOCHE
+  // 8. INICIO DE NOCHE (Gestión de Cola)
   socket.on('start_night', ({ roomId, dayCount }) => {
     const room = rooms.get(roomId);
-    if (!room) return;
-
-    room.phase = 'night';
-    room.dayCount = dayCount;
-    room.actions = {}; 
-    
-    // --- FILTRADO DE COLA (Regla de Noche 0 vs Resto) ---
-    const activeQueue = NIGHT_QUEUE_ORDER.filter(roleKey => {
-        const isNightZeroRole = ['ladron', 'cupido', 'nino_salvaje'].includes(roleKey);
-
-        // Caso 1: Noche Cero
-        if (room.dayCount === 0) {
-            // Solo entran los roles de setup inicial si existen y están vivos
-            return isNightZeroRole && room.players.some(p => p.role === roleKey && p.alive);
-        } 
-        
-        // Caso 2: Noches Normales (Día 1+)
-        else {
-            // EXCLUIR explícitamente roles de Noche 0
-            if (isNightZeroRole) return false;
-
-            // Lobo Albino: Solo noches pares (2, 4, 6...)
-            if (roleKey === 'lobo_albino') {
-                return room.players.some(p => p.role === 'lobo_albino' && p.alive) && (room.dayCount % 2 === 0);
-            }
-
-            // Lobos normales
-            if (roleKey === 'lobos') {
-                return room.players.some(p => (p.role === 'lobos' || p.status.isWolf) && p.alive);
-            }
-
-            // Resto de roles
-            return room.players.some(p => p.role === roleKey && p.alive);
+    if (!room) {
+        // Fallback por si llega solo el string ID
+        if (typeof roomId === 'string') {
+             const r = rooms.get(roomId);
+             if (r) {
+                 return handleStartNight(r, dayCount || r.dayCount, io);
+             }
         }
-    });
-
-    room.nightQueue = activeQueue;
-    room.queueIndex = -1;
-
-    // Elección de Portavoz Lobo
-    const wolves = room.players.filter(p => (p.role === 'lobos' || p.status.isWolf) && p.alive);
-    if (wolves.length > 0) {
-        const randomWolf = wolves[Math.floor(Math.random() * wolves.length)];
-        room.wolfSpokesperson = randomWolf.socketId;
+        return;
     }
-
-    nextTurn(room, io);
+    handleStartNight(room, dayCount, io);
   });
 
   // 9. ACCIÓN NOCTURNA
@@ -256,7 +232,7 @@ io.on('connection', (socket) => {
 
     room.actions = { ...room.actions, ...actionData };
 
-    // Ladrón: Transformación inmediata en Noche 0 para ajustar la cola
+    // Lógica Ladrón: Si cambia a un rol de Noche 0, inyectarlo en la cola
     if (actionData.newRole && actionData.thiefId) {
         const pIndex = room.players.findIndex(p => p.id === actionData.thiefId);
         if (pIndex !== -1) {
@@ -266,7 +242,6 @@ io.on('connection', (socket) => {
             const baseStatus = initializePlayerStatus(newRole, room.rolesConfig);
             room.players[pIndex].status = { ...room.players[pIndex].status, ...baseStatus };
             
-            // Si el ladrón elige ser Cupido o Niño Salvaje en Noche 0
             if (room.dayCount === 0) {
                 if (['cupido', 'nino_salvaje'].includes(newRole)) {
                     if (!room.nightQueue.includes(newRole)) {
@@ -287,7 +262,7 @@ io.on('connection', (socket) => {
     nextTurn(room, io);
   });
 
-  // 10. VOTACIÓN
+  // 10. VOTACIONES
   socket.on('start_voting', ({ roomId, type }) => {
     const room = rooms.get(roomId);
     if (!room) return;
@@ -299,12 +274,12 @@ io.on('connection', (socket) => {
 
   socket.on('cast_vote', ({ roomId, targetId, voterId }) => {
     const room = rooms.get(roomId);
-    if (!room) return;
+    if (!room) return; // Si targetId es null, es voto en blanco
     room.votes[voterId] = targetId;
-    io.to(room.hostId).emit('votes_update', room.votes);
+    io.to(room.hostId).emit('votes_update', room.votes); // Solo el narrador ve el recuento en vivo
   });
 
-  // 11. PUBLICAR RESULTADOS
+  // 11. PUBLICAR RESULTADOS (Amanecer / Sentencia)
   socket.on('publish_results', ({ roomId, updatedPlayers, phase, eventData }) => {
     const room = rooms.get(roomId);
     if (!room) return;
@@ -319,19 +294,54 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('force_action_interaction', ({ roomId, actionData }) => {
-     const room = rooms.get(roomId);
-     if (room) {
-         io.to(room.hostId).emit('force_action_received', actionData);
-     }
-  });
-  
   socket.on('disconnect', () => {
-      // Manejo de desconexión
+      // Opcional: Marcar desconectados visualmente en lobby
   });
 });
 
-// --- FUNCIONES AUXILIARES (DEFINIDAS FUERA DE IO.ON) ---
+// --- FUNCIONES LÓGICAS ---
+
+function handleStartNight(room, dayCount, io) {
+    room.phase = 'night';
+    room.dayCount = dayCount !== undefined ? dayCount : room.dayCount;
+    room.actions = {}; 
+    
+    // FILTRADO DE COLA
+    const activeQueue = NIGHT_QUEUE_ORDER.filter(roleKey => {
+        const isNightZeroRole = ['ladron', 'cupido', 'nino_salvaje'].includes(roleKey);
+
+        // Noche 0
+        if (room.dayCount === 0) {
+            return isNightZeroRole && room.players.some(p => p.role === roleKey && p.alive);
+        } 
+        // Noches normales (1+)
+        else {
+            if (isNightZeroRole) return false;
+
+            if (roleKey === 'lobo_albino') {
+                return room.players.some(p => p.role === 'lobo_albino' && p.alive) && (room.dayCount % 2 === 0);
+            }
+
+            if (roleKey === 'lobos') {
+                return room.players.some(p => (p.role === 'lobos' || p.status.isWolf) && p.alive);
+            }
+
+            return room.players.some(p => p.role === roleKey && p.alive);
+        }
+    });
+
+    room.nightQueue = activeQueue;
+    room.queueIndex = -1;
+
+    // Elegir Portavoz Lobo
+    const wolves = room.players.filter(p => (p.role === 'lobos' || p.status.isWolf) && p.alive);
+    if (wolves.length > 0) {
+        const randomWolf = wolves[Math.floor(Math.random() * wolves.length)];
+        room.wolfSpokesperson = randomWolf.socketId;
+    }
+
+    nextTurn(room, io);
+}
 
 function nextTurn(room, io) {
     room.queueIndex++;
@@ -340,7 +350,7 @@ function nextTurn(room, io) {
     if (room.queueIndex >= room.nightQueue.length) {
         room.phase = 'day_processing';
         io.to(room.hostId).emit('night_ended', { actions: room.actions });
-        io.to(room.id).emit('phase_change', 'day_wait');
+        io.to(room.id).emit('phase_change', 'day_wait'); // Jugadores esperan amanecer
         return;
     }
 
@@ -354,7 +364,7 @@ function nextTurn(room, io) {
 
         let status = 'sleeping';
         
-        // --- LÓGICA "DEAD MAN WALKING" ---
+        // Dead Man Walking: Si estaba vivo al anochecer, actúa aunque haya muerto hace 5 minutos
         if (p.alive) {
             if (currentRole === 'lobos') {
                 if (p.role === 'lobos' || p.status.isWolf) {
@@ -415,9 +425,7 @@ function initializePlayerStatus(role, rolesCount) {
     if (role === 'juez') status.judgePowerUsed = false;
     if (role === 'cuervo') status.cuervoUsed = false;
     
-    if (role === 'ladron') {
-        status.thiefChoices = []; 
-    }
+    if (role === 'ladron') status.thiefChoices = []; 
 
     return status;
 }
