@@ -9,12 +9,13 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "*", // En producción, se recomienda poner el dominio de tu frontend
+    origin: "*", 
     methods: ["GET", "POST"]
   }
 });
 
 // --- BASE DE DATOS EN MEMORIA ---
+// Estructura: roomId -> { ...estado }
 const rooms = new Map();
 
 // --- ORDEN MAESTRO DE LA NOCHE ---
@@ -58,9 +59,9 @@ io.on('connection', (socket) => {
     rooms.set(roomId, {
       id: roomId,
       hostId: socket.id,
-      gameMode: system, // 'standard' o 'custom'
-      players: [],
-      phase: 'lobby',        
+      gameMode: system, // 'standard' (digital) o 'custom' (manual)
+      players: [],      // Array ordenado (el orden de registro define los asientos)
+      phase: 'lobby',   // phases: lobby, assigning, distributing, game
       dayCount: 0,
       rolesConfig: {},
       nightQueue: [],
@@ -68,7 +69,7 @@ io.on('connection', (socket) => {
       currentTurnRole: null,
       wolfSpokesperson: null,
       actions: {},
-      votes: {},
+      votes: {}, // { voterId: targetId } (targetId null = voto en blanco/nulo)
       globalFlags: {
           ancientPowerLoss: false,
           hunterSource: null
@@ -85,26 +86,18 @@ io.on('connection', (socket) => {
     callback({ exists: rooms.has(roomId) });
   });
 
-  // 3. OBTENER IDENTIDADES DISPONIBLES
-  socket.on('get_available_identities', (roomId, callback) => {
-    const room = rooms.get(roomId);
-    if (!room) return callback([]);
-    callback(room.players.map(p => ({ 
-        name: p.name, 
-        socketId: p.socketId 
-    })));
-  });
-
-  // 4. ACTUALIZAR LISTA DE JUGADORES
+  // 3. ACTUALIZAR LISTA DE JUGADORES (Narrador registra nombres)
+  // IMPORTANTE: El orden de este array define la disposición de la mesa redonda
   socket.on('update_player_list', ({ roomId, players }) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
-    // Fusionar para mantener sockets si ya estaban conectados
+    // Fusionamos preservando sockets existentes si los hay
+    // El frontend manda la lista ordenada según registro
     const mergedPlayers = players.map(newP => {
-        const existing = room.players.find(p => p.id === newP.id);
+        const existing = room.players.find(p => p.name === newP.name); // Buscamos por nombre, no ID temporal
         return {
-            id: newP.id,
+            id: existing ? existing.id : newP.id, // Mantenemos ID estable
             name: newP.name,
             socketId: existing ? existing.socketId : null,
             role: existing ? existing.role : 'aldeano',
@@ -114,41 +107,44 @@ io.on('connection', (socket) => {
     });
 
     room.players = mergedPlayers;
-    io.to(roomId).emit('player_list_updated', room.players.map(p => ({ name: p.name, socketId: p.socketId })));
+    
+    // Emitimos la lista completa para que todos vean qué sitios están libres
+    io.to(roomId).emit('player_list_updated', room.players);
   });
 
-  // 5. RECLAMAR IDENTIDAD
-  socket.on('claim_identity', ({ roomId, name }, callback) => {
+  // 4. RECLAMAR ASIENTO (Jugador se identifica en la lista)
+  socket.on('claim_seat', ({ roomId, playerName }, callback) => {
     const room = rooms.get(roomId);
-    if (!room) return callback(false);
+    if (!room) return callback({ success: false, msg: "Sala no encontrada" });
 
-    const playerIndex = room.players.findIndex(p => p.name === name);
-    if (playerIndex === -1) return callback(false);
+    const playerIndex = room.players.findIndex(p => p.name === playerName);
+    if (playerIndex === -1) return callback({ success: false, msg: "Nombre no encontrado" });
     
-    // Evitar robo de identidad si ya tiene dueño
+    // Evitar robo de asiento
     if (room.players[playerIndex].socketId && room.players[playerIndex].socketId !== socket.id) {
-        return callback(false);
+        return callback({ success: false, msg: "Asiento ya ocupado" });
     }
 
     room.players[playerIndex].socketId = socket.id;
     socket.join(roomId);
     
-    io.to(roomId).emit('player_list_updated', room.players.map(p => ({ name: p.name, socketId: p.socketId })));
-    callback(true);
+    // Notificar a todos que el asiento se ha ocupado (se pondrá verde en el lobby)
+    io.to(roomId).emit('player_list_updated', room.players);
+    callback({ success: true, player: room.players[playerIndex] });
   });
 
-  // 6. INICIAR MODO ASIGNACIÓN MANUAL (Nuevo Evento)
-  // Esto avisa a los jugadores que el narrador está repartiendo cartas físicas
-  socket.on('start_manual_assign', ({ roomId }) => {
+  // 5. INICIAR REPARTO (Desde el Lobby)
+  socket.on('start_distribution', ({ roomId }) => {
       const room = rooms.get(roomId);
       if (!room) return;
       
-      room.phase = 'assigning';
-      // Emitimos cambio de fase para que los móviles muestren mensaje de espera
-      io.to(roomId).emit('phase_change', 'assigning');
+      // Si es custom, vamos a asignación manual. Si es standard, vamos a animación de barajar
+      const nextPhase = room.gameMode === 'custom' ? 'assigning' : 'distributing';
+      room.phase = nextPhase;
+      io.to(roomId).emit('phase_change', nextPhase);
   });
 
-  // 7. REPARTO DE ROLES (Soporta Digital y Manual)
+  // 6. DISTRIBUCIÓN DE ROLES (Digital o Manual confirmada)
   socket.on('distribute_roles', ({ roomId, rolesCount, manualAssignments }) => {
     const room = rooms.get(roomId);
     if (!room) return;
@@ -156,8 +152,8 @@ io.on('connection', (socket) => {
     room.rolesConfig = rolesCount;
 
     if (manualAssignments) {
-        // --- MODO PERSONALIZADO (Manual) ---
-        // Aplicar lógica de Sectario si existe
+        // --- MODO PERSONALIZADO ---
+        // Lógica Sectario
         let sectTeamAssignments = new Array(room.players.length).fill(null);
         if (rolesCount['sectario'] > 0) {
              const rolesArray = room.players.map(p => manualAssignments[p.id]);
@@ -172,7 +168,7 @@ io.on('connection', (socket) => {
         });
 
     } else {
-        // --- MODO DIGITAL (Aleatorio) ---
+        // --- MODO DIGITAL ---
         let deck = [];
         Object.entries(rolesCount).forEach(([role, count]) => {
             for(let i=0; i<count; i++) deck.push(role);
@@ -194,7 +190,7 @@ io.on('connection', (socket) => {
         });
     }
 
-    // EMITIR A CADA JUGADOR SU ROL
+    // EMITIR A CADA JUGADOR SU ROL INDIVIDUALMENTE
     room.players.forEach(p => {
         if (p.socketId) {
             io.to(p.socketId).emit('role_assigned', { 
@@ -207,41 +203,46 @@ io.on('connection', (socket) => {
 
     // Enviar estado completo al Narrador
     io.to(room.hostId).emit('full_state_update', { players: room.players });
+    
+    // Cambiar fase a "reveal" (para ver la carta)
+    io.to(roomId).emit('phase_change', 'reveal');
   });
 
-  // 8. INICIO DE NOCHE (Gestión de Cola)
+  // 7. COMENZAR PARTIDA (Tras ver cartas)
+  socket.on('game_start', (roomId) => {
+      const room = rooms.get(roomId);
+      if (!room) return;
+      room.phase = 'game';
+      io.to(roomId).emit('phase_change', 'game');
+  });
+
+  // 8. GESTIÓN DE LA NOCHE
   socket.on('start_night', ({ roomId, dayCount }) => {
     const room = rooms.get(roomId);
-    if (!room) {
-        // Fallback por si llega solo el string ID
-        if (typeof roomId === 'string') {
-             const r = rooms.get(roomId);
-             if (r) {
-                 return handleStartNight(r, dayCount || r.dayCount, io);
-             }
-        }
-        return;
-    }
+    if (!room) return;
+    
     handleStartNight(room, dayCount, io);
   });
 
-  // 9. ACCIÓN NOCTURNA
   socket.on('night_action', ({ roomId, actionData }) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
+    // Acumular acciones
     room.actions = { ...room.actions, ...actionData };
 
-    // Lógica Ladrón: Si cambia a un rol de Noche 0, inyectarlo en la cola
+    // Lógica Ladrón (Cambio de rol en tiempo real)
     if (actionData.newRole && actionData.thiefId) {
         const pIndex = room.players.findIndex(p => p.id === actionData.thiefId);
         if (pIndex !== -1) {
             const newRole = actionData.newRole;
             room.players[pIndex].role = newRole;
             
+            // Reinicializar status para el nuevo rol
             const baseStatus = initializePlayerStatus(newRole, room.rolesConfig);
             room.players[pIndex].status = { ...room.players[pIndex].status, ...baseStatus };
             
+            // Inyección dinámica en la cola si es Noche 0
             if (room.dayCount === 0) {
                 if (['cupido', 'nino_salvaje'].includes(newRole)) {
                     if (!room.nightQueue.includes(newRole)) {
@@ -250,6 +251,7 @@ io.on('connection', (socket) => {
                 }
             }
 
+            // Notificar al jugador ladrón de su cambio
             if (room.players[pIndex].socketId) {
                 io.to(room.players[pIndex].socketId).emit('role_update', { 
                     role: newRole, 
@@ -262,40 +264,71 @@ io.on('connection', (socket) => {
     nextTurn(room, io);
   });
 
-  // 10. VOTACIONES
+  // 9. SISTEMA DE VOTACIONES (Día y Linchamiento)
   socket.on('start_voting', ({ roomId, type }) => {
+    // type: 'mayor' | 'lynch'
     const room = rooms.get(roomId);
     if (!room) return;
 
     room.phase = type === 'mayor' ? 'voting_mayor' : 'voting_lynch';
     room.votes = {}; 
-    io.to(roomId).emit('start_voting', { type });
+    
+    // Notificar a todos para que muestren la interfaz de votación
+    io.to(roomId).emit('voting_started', { type });
   });
 
-  socket.on('cast_vote', ({ roomId, targetId, voterId }) => {
+  socket.on('cast_vote', ({ roomId, targetId }) => {
     const room = rooms.get(roomId);
-    if (!room) return; // Si targetId es null, es voto en blanco
-    room.votes[voterId] = targetId;
-    io.to(room.hostId).emit('votes_update', room.votes); // Solo el narrador ve el recuento en vivo
+    if (!room) return;
+    
+    // Identificar votante por socket
+    const voter = room.players.find(p => p.socketId === socket.id);
+    if (!voter) return;
+
+    // Registrar voto (targetId puede ser null para voto nulo)
+    room.votes[voter.id] = targetId;
+    
+    // Enviar progreso al Narrador (quién ha votado, no qué ha votado si es secreto, o todo si es público)
+    // Para simplificar, enviamos el estado de los votos al Narrador para que él calcule
+    io.to(room.hostId).emit('votes_update', room.votes);
   });
 
-  // 11. PUBLICAR RESULTADOS (Amanecer / Sentencia)
-  socket.on('publish_results', ({ roomId, updatedPlayers, phase, eventData }) => {
+  socket.on('close_voting', ({ roomId }) => {
+      const room = rooms.get(roomId);
+      if (!room) return;
+      // Narrador decide cerrar y calcular
+      // El cálculo se hace en el frontend del narrador y se emite publish_results
+  });
+
+  // 10. PUBLICAR RESULTADOS Y ACTUALIZAR ESTADO GLOBAL
+  // Se usa para: Amanecer, Resultado Votación, Eventos (Cazador, etc.)
+  socket.on('publish_results', ({ roomId, players, phase, eventData }) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
-    room.players = updatedPlayers;
-    room.phase = phase;
+    room.players = players;
+    if (phase) room.phase = phase;
 
+    // Broadcast a todos
     io.to(roomId).emit('game_update', {
         players: room.players,
-        phase: phase,
-        eventData: eventData
+        phase: room.phase,
+        eventData: eventData // Para modales específicos (muerte, victoria, etc.)
     });
   });
 
+  // 11. GESTIÓN DE EVENTOS ESPECIALES (Disparos, revivir, etc.)
+  socket.on('trigger_special_event', ({ roomId, eventType, payload }) => {
+      const room = rooms.get(roomId);
+      if (!room) return;
+      
+      // Reenvía el evento a todos para que muestren modales (ej: "Has muerto", "Cazador dispara")
+      io.to(roomId).emit('special_event', { type: eventType, payload });
+  });
+
   socket.on('disconnect', () => {
-      // Opcional: Marcar desconectados visualmente en lobby
+    // Opcional: Notificar desconexión en el lobby
+    // Recorrer rooms para encontrar al socket y marcarlo
   });
 });
 
@@ -306,26 +339,19 @@ function handleStartNight(room, dayCount, io) {
     room.dayCount = dayCount !== undefined ? dayCount : room.dayCount;
     room.actions = {}; 
     
-    // FILTRADO DE COLA
     const activeQueue = NIGHT_QUEUE_ORDER.filter(roleKey => {
         const isNightZeroRole = ['ladron', 'cupido', 'nino_salvaje'].includes(roleKey);
 
-        // Noche 0
         if (room.dayCount === 0) {
             return isNightZeroRole && room.players.some(p => p.role === roleKey && p.alive);
-        } 
-        // Noches normales (1+)
-        else {
+        } else {
             if (isNightZeroRole) return false;
-
             if (roleKey === 'lobo_albino') {
                 return room.players.some(p => p.role === 'lobo_albino' && p.alive) && (room.dayCount % 2 === 0);
             }
-
             if (roleKey === 'lobos') {
                 return room.players.some(p => (p.role === 'lobos' || p.status.isWolf) && p.alive);
             }
-
             return room.players.some(p => p.role === roleKey && p.alive);
         }
     });
@@ -338,6 +364,8 @@ function handleStartNight(room, dayCount, io) {
     if (wolves.length > 0) {
         const randomWolf = wolves[Math.floor(Math.random() * wolves.length)];
         room.wolfSpokesperson = randomWolf.socketId;
+    } else {
+        room.wolfSpokesperson = null;
     }
 
     nextTurn(room, io);
@@ -346,25 +374,27 @@ function handleStartNight(room, dayCount, io) {
 function nextTurn(room, io) {
     room.queueIndex++;
     
-    // FIN DE LA NOCHE
     if (room.queueIndex >= room.nightQueue.length) {
         room.phase = 'day_processing';
+        // Enviar todas las acciones al Narrador para que calcule muertes
         io.to(room.hostId).emit('night_ended', { actions: room.actions });
-        io.to(room.id).emit('phase_change', 'day_wait'); // Jugadores esperan amanecer
+        // Poner a los jugadores en espera
+        io.to(room.id).emit('phase_change', 'day_wait'); 
         return;
     }
 
     const currentRole = room.nightQueue[room.queueIndex];
     room.currentTurnRole = currentRole;
 
+    // Avisar al narrador de quién es el turno
     io.to(room.hostId).emit('narrator_turn_update', { role: currentRole });
 
+    // Avisar a los jugadores
     room.players.forEach(p => {
         if (!p.socketId) return;
 
-        let status = 'sleeping';
+        let status = 'sleeping'; // Estado por defecto: Pantalla genérica "Durmiendo..."
         
-        // Dead Man Walking: Si estaba vivo al anochecer, actúa aunque haya muerto hace 5 minutos
         if (p.alive) {
             if (currentRole === 'lobos') {
                 if (p.role === 'lobos' || p.status.isWolf) {
@@ -372,10 +402,10 @@ function nextTurn(room, io) {
                 }
             } 
             else if (currentRole === 'lobos' && p.role === 'nina') {
-                 status = 'spy'; 
+                 status = 'spy'; // La Niña espía
             }
             else if (p.role === currentRole) {
-                status = 'active';
+                status = 'active'; // ¡Es tu turno! Muestra el modal
             }
         }
 
@@ -384,7 +414,7 @@ function nextTurn(room, io) {
             role: currentRole,
             data: {
                 isSpokesperson: p.socketId === room.wolfSpokesperson,
-                players: room.players 
+                players: room.players // Para que puedan elegir objetivo
             }
         });
     });
